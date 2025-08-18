@@ -21,7 +21,7 @@ import numpy as np
 from pathlib import Path
 from datetime import datetime
 
-def make_vol_data(path, window=30, ann_factor=365):
+def make_vol_data(path, window, ann_factor=365):
     df = pd.read_feather(path)
     df['datetime'] = pd.to_datetime(df['datetime'])
     daily = (df.set_index('datetime')['close']
@@ -38,7 +38,6 @@ def make_vol_data(path, window=30, ann_factor=365):
 def realized_future_vol(log_returns, h=1, ann=365):
     """
     Computes the realized volatility target for forecast evaluation. This is what we will compare our forecasts against.
-
     For each day t, this function looks ahead to the next h days of log returns
     (t+1 ... t+h), calculates their volatility, annualizes it, and aligns the
     result back at index t.
@@ -49,7 +48,7 @@ def realized_future_vol(log_returns, h=1, ann=365):
 def naive_forecast(rv_est_pct, h=1):
     """
     Naive volatility forecast:
-    use today's vol estimate as forecast for next h days and scale appropriately.
+    Use today's vol estimate as forecast for next h days and scale appropriately.
     """
     return rv_est_pct.shift(1) * np.sqrt(h)
 
