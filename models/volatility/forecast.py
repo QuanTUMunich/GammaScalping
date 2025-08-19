@@ -4,59 +4,10 @@ import pandas as pd
 import numpy as np
 from arch import arch_model
 
-from models.volatility.targets import log_returns
+from .target import log_returns
 
 ann_days  = 365           
 ann_hours  = 24 * ann_days
-
-def make_vol_data(df_spot: pd.DataFrame, window: int, *, freq: str = "daily") -> pd.DataFrame:
-    """
-    Build a small table with close, log_returns, and a rolling vol estimate (annualized, %).
-
-    Parameters
-    ----------
-    df_spot : DataFrame
-        Hourly OHLC dataframe with DatetimeIndex and column 'close'.
-        (Already cleaned: datetime index set & sorted.)
-    window : int
-        Rolling window length in periods of `freq` (days if daily, hours if hourly).
-    freq : {'daily','hourly'}
-        Frequency at which to compute returns & rolling vol.
-
-    Returns
-    -------
-    DataFrame indexed by time with columns:
-      - 'close'        : close at chosen frequency
-      - 'log_returns'  : log returns at chosen frequency
-      - 'rv_est_pct'   : rolling std * sqrt(ann_factor) * 100 (annualized %)
-    """
-    freq = freq.lower()
-    if freq not in {"daily", "hourly"}:
-        raise ValueError("freq must be 'daily' or 'hourly'")
-
-    df_spot = df_spot.sort_index()
-
-    # 1) returns via your helper
-    r = log_returns(df_spot, out_freq=freq)
-
-    # 2) matching close series and annualization
-    if freq == "hourly":
-        ann = ann_hours
-        close = df_spot["close"].asfreq("h")
-    else:
-        ann = ann_days
-        close = df_spot["close"].resample("1D").last()
-
-    # 3) assemble output
-    out = pd.DataFrame(index=r.index)
-    out["close"] = close.reindex(out.index)
-    out["log_returns"] = r
-
-    # 4) rolling realized-vol estimate (annualized, %)
-    rv = out["log_returns"].rolling(window).std(ddof=0)
-    out["rv_est_pct"] = rv * np.sqrt(ann) * 100.0
-
-    return out
 
 def naive_forecast(rv_est_pct: pd.Series) -> pd.Series:
     """

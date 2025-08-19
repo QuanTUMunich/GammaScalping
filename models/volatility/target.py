@@ -1,4 +1,4 @@
-# models/volatility/targets.py
+# models/volatility/target.py
 
 import numpy as np
 import pandas as pd
