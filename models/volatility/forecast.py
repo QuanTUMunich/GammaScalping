@@ -9,12 +9,33 @@ from .target import log_returns
 ann_days  = 365           
 ann_hours  = 24 * ann_days
 
-def naive_forecast(rv_est_pct: pd.Series) -> pd.Series:
+# Naive forecast from any annualized % estimator series
+def naive_forecast(est_pct: pd.Series, horizon: int = 1) -> pd.Series:
     """
-    Naive volatility forecast (annualized, %):
-    simply use the last available volatility estimate as the forecast for the next step.
+    Naive volatility forecast (annualized, %).
+    Uses today's estimator as the forecast for the next h days.
+    Output remains annualized, %.
+
+    Parameters
+    ----------
+    est_pct : pd.Series
+        Annualized % volatility estimator (e.g. rv_est_pct / rv_parkinson_pct / rv_rs_pct).
+    horizon : int, default=1
+        Forecast horizon in calendar days (or hours if your estimator is hourly).
+
+    Returns
+    -------
+    pd.Series
+        Series of forecasts, annualized %, named f'fcst_naive_h{h}_pct'.
     """
-    return rv_est_pct.shift(1).rename("fcst_naive_pct")
+    if horizon < 1:
+        raise ValueError("horizon must be >= 1")
+
+    # Forecast = current estimate shifted forward to align with t+h target
+    f = est_pct.shift(1) * np.sqrt(horizon)
+    f.name = f"fcst_naive_h{h}_pct"
+    return f
+
 
 def garch_forecast(
     df_spot: pd.DataFrame,

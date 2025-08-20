@@ -77,3 +77,62 @@ def parkinson_vol(df_spot: pd.DataFrame, window: int, *, freq: str = "daily") ->
     park_vol.name = 'rv_parkinson_pct'
 
     return park_vol.reindex(idx)
+
+# Rogers–Satchell volatility estimator
+def rs_vol(df_spot: pd.DataFrame, window: int, *, freq: str = "daily") -> pd.Series:
+    """
+    NEW METHOD: Rolling Rogers–Satchell volatility (annualized, %) from OHLC data.
+
+    Parameters
+    ----------
+    df_spot : DataFrame
+        Hourly OHLC with DatetimeIndex and columns: 'open','high','low','close'.
+    window : int
+        Rolling window length in periods of `freq` (days if daily, hours if hourly).
+    freq : {'daily','hourly'}
+        Frequency at which to compute the rolling estimator.
+
+    Returns
+    -------
+    pd.Series
+        'rv_rs_pct' aligned to the chosen frequency index, annualized in %.
+    """
+    freq = freq.lower()
+    if freq not in {"daily", "hourly"}:
+        raise ValueError("freq must be 'daily' or 'hourly'")
+
+    df_spot = df_spot.sort_index()
+
+    if freq == "hourly":
+        ann  = ann_hours
+        ohlc = df_spot[['open','high','low','close']].asfreq('h')
+        idx  = ohlc.index
+    else:
+        ann  = ann_days
+        ohlc = (df_spot[['open','high','low','close']]
+                .resample('1D')
+                .agg({'open':'first','high':'max','low':'min','close':'last'}))
+        idx  = ohlc.index
+
+    # Rogers–Satchell per-period variance:
+    # u = ln(H/C), d = ln(L/C), o = ln(O/C)
+    # RS_var = u*(u - o) + d*(d - o)
+    c = ohlc['close']
+    o = ohlc['open']
+    h = ohlc['high']
+    l = ohlc['low']
+
+    u = np.log(h / c)
+    d = np.log(l / c)
+    o_rel = np.log(o / c)
+
+    rs_var_per_period = u * (u - o_rel) + d * (d - o_rel)
+
+    # Rolling mean of per-period variance, then sqrt and annualize
+    rs_var_roll = rs_var_per_period.rolling(window).mean().clip(lower=0)
+    rs_vol_per_period = np.sqrt(rs_var_roll)
+
+    rs_vol_ann_pct = rs_vol_per_period * np.sqrt(ann) * 100.0
+    rs_vol_ann_pct.name = 'rv_rs_pct'
+
+    return rs_vol_ann_pct.reindex(idx)
