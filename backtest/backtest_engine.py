@@ -1,15 +1,12 @@
 import numpy as np
 import pandas as pd
-from typing import Dict, List, Optional, Callable, Any
+from typing import Dict, List, Optional, Any
 from dataclasses import dataclass
-from abc import ABC, abstractmethod
 import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from simulation.gamma_scalping_sim import GammaScalpingSimulator
-from simulation.portfolio_dynamics import PortfolioDynamics
-from analytics.pnl_decomposition import PnLDecomposition
+from simulation.gamma_scalping_simulator import GammaScalpingSimulator, GammaScalpingResult
 from models.options_pricing import implied_volatility
 
 @dataclass
@@ -27,83 +24,31 @@ class StrategyConfig:
     """Configuration for strategy variant"""
     name: str
     hedge_threshold: float = 0.1  # Delta threshold for rebalancing
-    hedge_method: str = 'delta_band'  # 'delta_band', 'time_based', 'gamma_scaled'
-    rebalance_frequency: str = '1H'  # For time-based hedging
     option_selection: str = 'atm'  # 'atm', 'otm_call', 'otm_put', 'straddle'
     otm_percent: float = 0.05  # For OTM selection (5% OTM)
     position_size: float = 1.0  # Number of option contracts
-    max_gamma_exposure: float = 100  # Maximum gamma exposure allowed
     vol_adjustment: bool = False  # Adjust thresholds based on volatility
-    
-class HedgingStrategy(ABC):
-    """Abstract base class for hedging strategies"""
-    
-    @abstractmethod
-    def should_hedge(self, portfolio: PortfolioDynamics, config: StrategyConfig) -> bool:
-        """Determine if hedging is needed"""
-        pass
-    
-    @abstractmethod
-    def calculate_hedge_size(self, portfolio: PortfolioDynamics, config: StrategyConfig) -> float:
-        """Calculate required hedge size"""
-        pass
-
-class DeltaBandHedging(HedgingStrategy):
-    """Hedge when delta exceeds threshold bands"""
-    
-    def should_hedge(self, portfolio: PortfolioDynamics, config: StrategyConfig) -> bool:
-        greeks = portfolio.get_portfolio_greeks()
-        return abs(greeks['delta']) > config.hedge_threshold
-    
-    def calculate_hedge_size(self, portfolio: PortfolioDynamics, config: StrategyConfig) -> float:
-        return portfolio.calculate_hedge_requirement(target_delta=0)
-
-class TimeBasedHedging(HedgingStrategy):
-    """Hedge at fixed time intervals"""
-    
-    def __init__(self):
-        self.last_hedge_time = None
-    
-    def should_hedge(self, portfolio: PortfolioDynamics, config: StrategyConfig) -> bool:
-        # Implementation would check time since last hedge
-        return True  # Simplified
-    
-    def calculate_hedge_size(self, portfolio: PortfolioDynamics, config: StrategyConfig) -> float:
-        return portfolio.calculate_hedge_requirement(target_delta=0)
-
-class GammaScaledHedging(HedgingStrategy):
-    """Hedge with thresholds scaled by gamma exposure"""
-    
-    def should_hedge(self, portfolio: PortfolioDynamics, config: StrategyConfig) -> bool:
-        greeks = portfolio.get_portfolio_greeks()
-        gamma_adjusted_threshold = config.hedge_threshold * max(0.5, 1 / (1 + abs(greeks['gamma'])))
-        return abs(greeks['delta']) > gamma_adjusted_threshold
-    
-    def calculate_hedge_size(self, portfolio: PortfolioDynamics, config: StrategyConfig) -> float:
-        greeks = portfolio.get_portfolio_greeks()
-        # Partial hedge based on gamma
-        hedge_ratio = min(1.0, abs(greeks['gamma']) / config.max_gamma_exposure)
-        return portfolio.calculate_hedge_requirement(target_delta=0, hedge_ratio=hedge_ratio)
 
 class BacktestEngine:
     """
-    Main backtesting engine for gamma scalping strategies.
-    Supports multiple strategy variants and comprehensive analysis.
+    Backtesting engine for gamma scalping strategies.
+    Uses per-option simulation for clear P&L attribution.
     """
     
     def __init__(self, config: BacktestConfig):
         self.config = config
-        self.hedging_strategies = {
-            'delta_band': DeltaBandHedging(),
-            'time_based': TimeBasedHedging(),
-            'gamma_scaled': GammaScaledHedging()
-        }
+        self.simulator = GammaScalpingSimulator(
+            commission_rate=config.commission_rate,
+            slippage_bps=config.slippage_bps,
+            risk_free_rate=config.risk_free_rate
+        )
         
     def select_options(
         self,
         spot_price: float,
         available_options: pd.DataFrame,
-        config: StrategyConfig
+        config: StrategyConfig,
+        current_timestamp: pd.Timestamp
     ) -> pd.DataFrame:
         """Select options based on strategy configuration"""
         
@@ -111,7 +56,7 @@ class BacktestEngine:
             return pd.DataFrame()
         
         # Filter by days to expiry (prefer 7-30 DTE)
-        available_options['dte'] = (available_options['expiry'] - pd.Timestamp.now()).dt.days
+        available_options['dte'] = (available_options['expiry'] - current_timestamp).dt.days
         options = available_options[(available_options['dte'] >= 7) & (available_options['dte'] <= 30)]
         
         if options.empty:
@@ -154,6 +99,7 @@ class BacktestEngine:
     ) -> Dict[str, Any]:
         """
         Run backtest for a specific strategy configuration.
+        Simulates each selected option independently.
         
         Args:
             spot_data: DataFrame with columns ['timestamp', 'close']
@@ -162,22 +108,8 @@ class BacktestEngine:
             strategy_config: Strategy configuration
         
         Returns:
-            Dictionary with backtest results
+            Dictionary with aggregated backtest results
         """
-        
-        # Initialize simulator and portfolio
-        simulator = GammaScalpingSimulator(
-            initial_capital=self.config.initial_capital,
-            commission_rate=self.config.commission_rate,
-            slippage_bps=self.config.slippage_bps,
-            risk_free_rate=self.config.risk_free_rate
-        )
-        
-        portfolio = PortfolioDynamics(risk_free_rate=self.config.risk_free_rate)
-        pnl_decomposer = PnLDecomposition()
-        
-        # Get hedging strategy
-        hedge_strategy = self.hedging_strategies[strategy_config.hedge_method]
         
         # Filter data by date range
         if self.config.start_date:
@@ -187,147 +119,89 @@ class BacktestEngine:
             spot_data = spot_data[spot_data['timestamp'] <= self.config.end_date]
             options_data = options_data[options_data['timestamp'] <= self.config.end_date]
         
-        # Main backtest loop
-        position_opened = False
-        current_options = []
+        # Get initial timestamp and spot price
+        if spot_data.empty or options_data.empty:
+            return {'error': 'No data available for backtest period'}
+            
+        initial_timestamp = spot_data['timestamp'].min()
+        initial_spot = spot_data[spot_data['timestamp'] == initial_timestamp]['close'].iloc[0]
         
-        for idx, spot_row in spot_data.iterrows():
-            timestamp = spot_row['timestamp']
-            spot_price = spot_row['close']
-            
-            # Get available options at this timestamp
-            current_option_data = options_data[options_data['timestamp'] == timestamp]
-            
-            # Open position if not already opened
-            if not position_opened and not current_option_data.empty:
-                selected_options = self.select_options(spot_price, current_option_data, strategy_config)
-                
-                for _, opt in selected_options.iterrows():
-                    # Calculate implied volatility
-                    time_to_expiry = (opt['expiry'] - timestamp).total_seconds() / (365 * 24 * 3600)
-                    if time_to_expiry > 0:
-                        # Option price is already in USD (converted by data loader)
-                        option_price_usd = opt['close']
-                        
-                        iv = implied_volatility(
-                            option_price_usd, spot_price, opt['strike'],
-                            time_to_expiry, self.config.risk_free_rate, opt['option_type']
-                        )
-                        
-                        if not np.isnan(iv):
-                            # Open option position
-                            portfolio.add_option_position(
-                                symbol='BTC',
-                                strike=opt['strike'],
-                                expiry=opt['expiry'],
-                                option_type=opt['option_type'],
-                                quantity=strategy_config.position_size,
-                                price=option_price_usd,
-                                spot=spot_price,
-                                iv=iv,
-                                timestamp=timestamp
-                            )
-                            current_options.append(opt)
-                            position_opened = True
-            
-            # Update portfolio with current market data
-            if position_opened:
-                # Get current option prices and IVs
-                option_prices = {}
-                option_ivs = {}
-                
-                for opt in current_options:
-                    opt_data = current_option_data[
-                        (current_option_data['strike'] == opt['strike']) &
-                        (current_option_data['expiry'] == opt['expiry']) &
-                        (current_option_data['option_type'] == opt['option_type'])
-                    ]
-                    
-                    if not opt_data.empty:
-                        position_id = f"BTC_{opt['strike']}_{opt['expiry'].strftime('%Y%m%d')}_{opt['option_type']}"
-                        
-                        # Option price is already in USD (converted by data loader)
-                        option_price_usd = opt_data['close'].iloc[0]
-                        option_prices[position_id] = option_price_usd
-                        
-                        # Calculate IV
-                        time_to_expiry = (opt['expiry'] - timestamp).total_seconds() / (365 * 24 * 3600)
-                        if time_to_expiry > 0:
-                            iv = implied_volatility(
-                                option_price_usd, spot_price, opt['strike'],
-                                time_to_expiry, self.config.risk_free_rate, opt['option_type']
-                            )
-                            if not np.isnan(iv):
-                                option_ivs[position_id] = iv
-                
-                # Update portfolio
-                portfolio.update_market_data(
-                    timestamp=timestamp,
-                    spot_prices={'BTC': spot_price},
-                    option_ivs=option_ivs,
-                    option_prices=option_prices
-                )
-                
-                # Check if hedging is needed
-                if hedge_strategy.should_hedge(portfolio, strategy_config):
-                    hedge_size = hedge_strategy.calculate_hedge_size(portfolio, strategy_config)
-                    
-                    if abs(hedge_size) > 0.001:  # Minimum hedge size
-                        portfolio.add_stock_hedge('BTC', hedge_size, spot_price)
+        # Select options to trade
+        initial_options = options_data[options_data['timestamp'] == initial_timestamp]
+        selected_options = self.select_options(initial_spot, initial_options, strategy_config, initial_timestamp)
         
-        # Generate results
-        portfolio_history = portfolio.get_history_dataframe()
+        if selected_options.empty:
+            return {'error': 'No suitable options found'}
         
-        # Calculate performance metrics
-        if not portfolio_history.empty:
-            final_pnl = portfolio.get_pnl_breakdown()
-            greeks_history = portfolio.get_portfolio_greeks()
+        # Run simulation for each selected option
+        results = []
+        for _, option in selected_options.iterrows():
+            # Get data for this specific option
+            option_data = options_data[
+                (options_data['strike'] == option['strike']) &
+                (options_data['expiry'] == option['expiry']) &
+                (options_data['option_type'] == option['option_type'])
+            ]
             
-            # P&L decomposition
-            pnl_report = pnl_decomposer.generate_attribution_report(
-                portfolio_history,
-                pd.DataFrame()  # Would pass actual trades here
+            if option_data.empty:
+                continue
+                
+            # Run simulation
+            result = self.simulator.simulate(
+                spot_prices=spot_data,
+                option_data=option_data,
+                hedge_threshold=strategy_config.hedge_threshold,
+                position_size=strategy_config.position_size
             )
             
-            # Calculate key metrics
-            total_return = final_pnl['total_pnl'] / self.config.initial_capital
-            
-            if 'total_pnl' in portfolio_history.columns:
-                returns = portfolio_history['total_pnl'].diff() / self.config.initial_capital
-                sharpe = np.sqrt(252) * returns.mean() / returns.std() if returns.std() > 0 else 0
-                
-                # Fix max drawdown calculation - use percentage not absolute
-                cumulative_value = self.config.initial_capital + portfolio_history['total_pnl']
-                running_max = cumulative_value.expanding().max()
-                drawdown = (cumulative_value - running_max) / running_max
-                max_dd = abs(drawdown.min()) if len(drawdown) > 0 else 0
-            else:
-                sharpe = 0
-                max_dd = 0
-            
-            results = {
-                'strategy_name': strategy_config.name,
-                'total_return': total_return,
-                'sharpe_ratio': sharpe,
-                'max_drawdown': max_dd,
-                'final_pnl': final_pnl,
-                'portfolio_history': portfolio_history,
-                'pnl_attribution': pnl_report,
-                'config': strategy_config
-            }
-        else:
-            results = {
-                'strategy_name': strategy_config.name,
-                'total_return': 0,
-                'sharpe_ratio': 0,
-                'max_drawdown': 0,
-                'final_pnl': {},
-                'portfolio_history': pd.DataFrame(),
-                'pnl_attribution': pd.DataFrame(),
-                'config': strategy_config
-            }
+            if result:
+                results.append(result)
         
-        return results
+        # Aggregate results
+        if not results:
+            return {'error': 'No successful simulations'}
+            
+        total_option_pnl = sum(r.option_pnl for r in results)
+        total_hedge_pnl = sum(r.hedge_pnl for r in results)
+        total_pnl = sum(r.total_pnl for r in results)
+        total_commissions = sum(r.commission_cost for r in results)
+        total_slippage = sum(r.slippage_cost for r in results)
+        
+        # Calculate metrics
+        total_return = total_pnl / self.config.initial_capital
+        avg_return = total_pnl / len(results) / self.config.initial_capital
+        
+        # Simple Sharpe calculation
+        if len(results) > 1:
+            returns = [r.total_pnl / self.config.initial_capital for r in results]
+            sharpe = np.mean(returns) / np.std(returns) * np.sqrt(252) if np.std(returns) > 0 else 0
+        else:
+            sharpe = 0
+            
+        # Calculate max drawdown from aggregated P&L history
+        if results[0].pnl_history is not None and not results[0].pnl_history.empty:
+            cumulative_pnl = sum(r.pnl_history['total_pnl'].values for r in results if r.pnl_history is not None)
+            running_max = np.maximum.accumulate(cumulative_pnl)
+            drawdown = (cumulative_pnl - running_max) / self.config.initial_capital
+            max_drawdown = drawdown.min() if len(drawdown) > 0 else 0
+        else:
+            max_drawdown = 0
+            
+        # Return results dictionary
+        return {
+            'strategy_name': strategy_config.name,
+            'total_return': total_return,
+            'sharpe_ratio': sharpe,
+            'max_drawdown': max_drawdown,
+            'option_pnl': total_option_pnl,
+            'hedge_pnl': total_hedge_pnl,
+            'total_pnl': total_pnl,
+            'commission_cost': total_commissions,
+            'slippage_cost': total_slippage,
+            'num_options': len(results),
+            'avg_hedges': np.mean([r.num_hedges for r in results]),
+            'results': results  # Keep individual option results
+        }
     
     def run_multiple_strategies(
         self,
@@ -344,24 +218,20 @@ class BacktestEngine:
             result = self.run_backtest(spot_data, options_data, config)
             
             # Extract key metrics
-            summary = {
-                'strategy': config.name,
-                'hedge_method': config.hedge_method,
-                'hedge_threshold': config.hedge_threshold,
-                'option_selection': config.option_selection,
-                'total_return': result['total_return'],
-                'sharpe_ratio': result['sharpe_ratio'],
-                'max_drawdown': result['max_drawdown']
-            }
-            
-            # Add P&L breakdown if available
-            if 'final_pnl' in result and result['final_pnl']:
-                summary.update({
-                    'option_pnl': result['final_pnl'].get('option_pnl', 0),
-                    'hedge_pnl': result['final_pnl'].get('stock_pnl', 0)
-                })
-            
-            results.append(summary)
+            if 'error' not in result:
+                summary = {
+                    'strategy': config.name,
+                    'hedge_threshold': config.hedge_threshold,
+                    'option_selection': config.option_selection,
+                    'total_return': result.get('total_return', 0),
+                    'sharpe_ratio': result.get('sharpe_ratio', 0),
+                    'max_drawdown': result.get('max_drawdown', 0),
+                    'option_pnl': result.get('option_pnl', 0),
+                    'hedge_pnl': result.get('hedge_pnl', 0),
+                    'total_pnl': result.get('total_pnl', 0),
+                    'num_options': result.get('num_options', 0)
+                }
+                results.append(summary)
         
         return pd.DataFrame(results)
     
@@ -392,7 +262,6 @@ class BacktestEngine:
             config = StrategyConfig(
                 name=f"opt_{'-'.join(map(str, values))}",
                 hedge_threshold=base_config.hedge_threshold,
-                hedge_method=base_config.hedge_method,
                 option_selection=base_config.option_selection,
                 position_size=base_config.position_size
             )

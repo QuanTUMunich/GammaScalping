@@ -1,7 +1,7 @@
 import pandas as pd
 import numpy as np
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Iterator
 import pyarrow.feather as feather
 import re
 from datetime import datetime, timedelta
@@ -193,6 +193,41 @@ class DataLoader:
             return pd.concat(all_options, ignore_index=True).sort_values('timestamp')
         
         return pd.DataFrame()
+
+    def list_option_symbols(self, underlying: str = 'BTC') -> List[str]:
+        """List available option symbols (directory names) for an underlying."""
+        symbols: List[str] = []
+        if not self.options_path.exists():
+            return symbols
+        for option_dir in self.options_path.iterdir():
+            if option_dir.is_dir() and option_dir.name.startswith(underlying):
+                symbols.append(option_dir.name)
+        return sorted(symbols)
+
+    def iter_options(
+        self,
+        underlying: str = 'BTC',
+        start_date: Optional[pd.Timestamp] = None,
+        end_date: Optional[pd.Timestamp] = None,
+        min_volume: float = 0,
+        min_oi: float = 0,
+        data_type: str = 'bars_1h'
+    ) -> Iterator[Tuple[str, pd.DataFrame]]:
+        """Yield per-option DataFrames without merging with spot.
+
+        Yields tuples of (symbol, option_df) filtered by date and basic liquidity constraints.
+        """
+        for symbol in self.list_option_symbols(underlying=underlying):
+            df = self.load_option_data(symbol, data_type=data_type, start_date=start_date, end_date=end_date)
+            if df.empty:
+                continue
+            if min_volume > 0 and 'volume' in df.columns:
+                df = df[df['volume'] >= min_volume]
+            if min_oi > 0 and 'open_interest' in df.columns:
+                df = df[df['open_interest'] >= min_oi]
+            if df.empty:
+                continue
+            yield symbol, df
     
     def create_synchronized_dataset(
         self,
@@ -257,6 +292,41 @@ class DataLoader:
                     options_data[col] = options_data[col] * options_data['spot_price']
         
         return spot_data, options_data
+
+    def create_dataset_dict(
+        self,
+        spot_symbol: str = 'BTCUSDT',
+        underlying: str = 'BTC',
+        start_date: Optional[pd.Timestamp] = None,
+        end_date: Optional[pd.Timestamp] = None,
+        option_filters: Optional[Dict] = None,
+    ) -> Tuple[pd.DataFrame, Dict[str, pd.DataFrame]]:
+        """Return separate spot DataFrame and a dict of per-option DataFrames.
+
+        The options dict is keyed by option symbol directory name and values are
+        raw option DataFrames (no spot merge). Columns include at least
+        ['timestamp','open','high','low','close','strike','expiry','option_type','symbol']
+        if available.
+        """
+        # Load spot
+        spot_df = self.load_spot_data(spot_symbol, start_date=start_date, end_date=end_date)
+
+        # Load options per symbol
+        min_volume = option_filters.get('min_volume', 0) if option_filters else 0
+        min_oi = option_filters.get('min_oi', 0) if option_filters else 0
+
+        options_dict: Dict[str, pd.DataFrame] = {}
+        for symbol, df in self.iter_options(
+            underlying=underlying,
+            start_date=start_date,
+            end_date=end_date,
+            min_volume=min_volume,
+            min_oi=min_oi,
+            data_type='bars_1h',
+        ):
+            options_dict[symbol] = df.sort_values('timestamp').reset_index(drop=True)
+
+        return spot_df, options_dict
     
     def get_option_chain(
         self,
