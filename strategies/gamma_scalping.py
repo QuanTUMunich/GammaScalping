@@ -44,34 +44,38 @@ def analyze_option_chain_from_dict(
             continue
         df_sorted = df.sort_values('timestamp')
         start_time = df_sorted['timestamp'].min()
-        # Align spot at start
-        spot_row = spot_data[spot_data['timestamp'] == start_time]
+        
+        # Get spot price when this option first appears for moneyness calculation
+        spot_row = spot_data[spot_data['timestamp'] >= start_time].head(1)
         if spot_row.empty:
-            # try nearest merge-asof within 1h
-            spot_asof = pd.merge_asof(
-                df_sorted[['timestamp']].head(1).sort_values('timestamp'),
-                spot_data[['timestamp','close']].sort_values('timestamp'),
-                on='timestamp', direction='nearest', tolerance=pd.Timedelta('1h')
-            )
-            start_spot = spot_asof['close'].iloc[0] if not spot_asof.empty else np.nan
-        else:
-            start_spot = spot_row['close'].iloc[0]
+            continue
+        start_spot = spot_row['close'].iloc[0]
         if pd.isna(start_spot) or start_spot <= 0:
             continue
+            
+        # Calculate DTE from when option first appears (its natural lifecycle)
+        expiry = df_sorted['expiry'].iloc[0]
+        dte = (expiry - start_time).days
+        
+        # Skip if option is already expired when it appears
+        if dte <= 0:
+            continue
+            
         avg_volume = df['volume'].mean() if 'volume' in df.columns else 0.0
         avg_oi = df['open_interest'].mean() if 'open_interest' in df.columns else 0.0
-        dte = (df_sorted['expiry'].iloc[0] - start_time).days
         moneyness = df_sorted['strike'].iloc[0] / start_spot
+        
         rows.append({
             'symbol': symbol,
             'strike': df_sorted['strike'].iloc[0],
-            'expiry': df_sorted['expiry'].iloc[0],
+            'expiry': expiry,
             'option_type': df_sorted['option_type'].iloc[0],
-            'dte': dte,
+            'dte': dte,  # Natural DTE when option appears
             'moneyness': moneyness,
             'avg_volume': avg_volume,
             'avg_oi': avg_oi,
-            'num_observations': len(df_sorted)
+            'num_observations': len(df_sorted),
+            'first_timestamp': start_time  # Track when option enters our dataset
         })
     unique_options = pd.DataFrame(rows)
     
@@ -137,8 +141,10 @@ def run_portfolio_backtest(
     target_dte: int = 30,
     moneyness_filter: str = 'ATM',  # 'ATM', 'OTM', 'ITM', or 'all'
     select: str = 'filtered',       # 'filtered' uses DTE/moneyness/liquidity; 'all' runs every option
-    workers: int = 1                # >1 uses threads to run options in parallel per strategy
-) -> pd.DataFrame:
+    workers: int = 1,               # >1 uses threads to run options in parallel per strategy
+    aggregate_timeseries: bool = False,
+    return_raw: bool = False
+) -> pd.DataFrame | Dict[str, Any]:
     """
     Run backtests across multiple options and strategies.
     
@@ -227,7 +233,7 @@ def run_portfolio_backtest(
             print(f"Strike range: {option_chain['strike'].min():.0f} - {option_chain['strike'].max():.0f}")
             print(f"DTE range: {option_chain['dte'].min()} - {option_chain['dte'].max()} days")
     
-    # Initialize simulator
+    # Initialize simulator with consistent parameters
     simulator = GammaScalpingSimulator(
         commission_rate=0.0005,
         slippage_bps=10,
@@ -236,10 +242,16 @@ def run_portfolio_backtest(
     
     # Run backtests
     all_results = []
+    ts_frames: List[pd.DataFrame] = []  # collect per-strategy time series if requested
+    raw_results_map: Dict[str, List[GammaScalpingResult]] = {} if return_raw else None
     
     for strategy_config in strategy_configs:
         print(f"\n--- Testing strategy: {strategy_config.name} ---")
         strategy_results = []
+
+        # Collect full GammaScalpingResult objects if requested (for downstream notebook wrangling)
+        collect_raw = aggregate_timeseries or return_raw
+        raw_results: List[GammaScalpingResult] = [] if collect_raw else None
 
         if workers and workers > 1:
             # Parallel execution per option (thread-based)
@@ -254,11 +266,7 @@ def run_portfolio_backtest(
                         spot_data,
                         opt_data,
                         strategy_config,
-                        GammaScalpingSimulator(
-                            commission_rate=0.0005,
-                            slippage_bps=10,
-                            risk_free_rate=0.01
-                        )
+                        simulator  # Use the same simulator instance
                     ))
 
                 pbar = tqdm(total=len(futures), desc="Options", leave=False)
@@ -266,6 +274,8 @@ def run_portfolio_backtest(
                     result = fut.result()
                     pbar.update(1)
                     if result:
+                        if collect_raw:
+                            raw_results.append(result)
                         strategy_results.append({
                             'strategy': strategy_config.name,
                             'hedge_threshold': strategy_config.hedge_threshold,
@@ -300,6 +310,8 @@ def run_portfolio_backtest(
                     simulator=simulator
                 )
                 if result:
+                    if collect_raw:
+                        raw_results.append(result)
                     strategy_results.append({
                         'strategy': strategy_config.name,
                         'hedge_threshold': strategy_config.hedge_threshold,
@@ -320,22 +332,48 @@ def run_portfolio_backtest(
                     })
                 pbar.update(1)
             pbar.close()
-        
+
+        # Per-strategy summary and optional collections
         if strategy_results:
             strategy_df = pd.DataFrame(strategy_results)
-            
+
             # Calculate strategy-level statistics
             total_pnl = strategy_df['total_pnl'].sum()
             avg_pnl = strategy_df['total_pnl'].mean()
             win_rate = (strategy_df['total_pnl'] > 0).mean()
-            
+
             print(f"\nResults for {strategy_config.name}:")
             print(f"  Total P&L: ${total_pnl:,.2f}")
             print(f"  Average P&L per option: ${avg_pnl:,.2f}")
             print(f"  Win rate: {win_rate:.1%}")
             print(f"  Options traded: {len(strategy_df)}")
-            
+
             all_results.extend(strategy_results)
+
+            if return_raw and raw_results is not None:
+                # Store raw results keyed by strategy
+                raw_results_map[strategy_config.name] = raw_results
+
+            if aggregate_timeseries and raw_results:
+                # Merge per-option P&L histories and average across options at each timestamp
+                merged_ts: pd.DataFrame | None = None
+                for res in raw_results:
+                    if res.pnl_history is None or res.pnl_history.empty:
+                        continue
+                    ts = res.pnl_history[['timestamp', 'total_pnl']].copy()
+                    ts = ts.rename(columns={'total_pnl': f'pnl_{res.option_symbol}'})
+                    if merged_ts is None:
+                        merged_ts = ts
+                    else:
+                        merged_ts = merged_ts.merge(ts, on='timestamp', how='outer')
+                if merged_ts is not None and not merged_ts.empty:
+                    merged_ts = merged_ts.sort_values('timestamp')
+                    value_cols = [c for c in merged_ts.columns if c.startswith('pnl_')]
+                    merged_ts['avg_total_pnl'] = merged_ts[value_cols].mean(axis=1, skipna=True)
+                    merged_ts['sum_total_pnl'] = merged_ts[value_cols].sum(axis=1, skipna=True)
+                    merged_ts['strategy'] = strategy_config.name
+                    merged_ts['active'] = merged_ts[value_cols].notna().sum(axis=1)
+                    ts_frames.append(merged_ts[['timestamp', 'strategy', 'avg_total_pnl', 'sum_total_pnl', 'active']])
     
     # Create results DataFrame
     results_df = pd.DataFrame(all_results)
@@ -357,123 +395,19 @@ def run_portfolio_backtest(
         print("SUMMARY BY STRATEGY")
         print("=" * 60)
         print(summary)
-        
-        # Save results
-    output_dir = Path('backtest/results')
-    output_dir.mkdir(parents=True, exist_ok=True)
-        
-    # Derive period for filename from spot data
-    period_start = pd.to_datetime(spot_data['timestamp']).min().strftime("%Y%m%d")
-    period_end = pd.to_datetime(spot_data['timestamp']).max().strftime("%Y%m%d")
-    results_file = output_dir / f'improved_gamma_scalping_{period_start}_{period_end}.csv'
-    results_df.to_csv(results_file, index=False)
-    print(f"\nDetailed results saved to: {results_file}")
     
+    # Build return payloads
+    if aggregate_timeseries and ts_frames:
+        ts_df = pd.concat(ts_frames, ignore_index=True)
+    else:
+        ts_df = None
+
+    if return_raw or aggregate_timeseries:
+        return {
+            'summary_df': results_df,
+            'timeseries_df': ts_df,
+            'raw_results': raw_results_map if return_raw else None,
+        }
+
+    # Backward-compatible return
     return results_df
-
-
-def main():
-    """Main function to run improved gamma scalping research"""
-    
-    # Define strategies to test
-    strategies = [
-        StrategyConfig(
-            name="Conservative (15%)",
-            hedge_threshold=0.15,
-            option_selection='atm',
-            position_size=1.0
-        ),
-        StrategyConfig(
-            name="Moderate (10%)",
-            hedge_threshold=0.10,
-            option_selection='atm',
-            position_size=1.0
-        ),
-        StrategyConfig(
-            name="Aggressive (5%)",
-            hedge_threshold=0.05,
-            option_selection='atm',
-            position_size=1.0
-        ),
-        StrategyConfig(
-            name="Very Aggressive (2.5%)",
-            hedge_threshold=0.025,
-            option_selection='atm',
-            position_size=1.0
-        )
-    ]
-    
-    # Test different time periods
-    test_periods = [
-        # Recent data (if available)
-        (pd.Timestamp('2024-01-01'), pd.Timestamp('2024-06-30'), 'H1 2024'),
-        # Historical periods
-        (pd.Timestamp('2023-01-01'), pd.Timestamp('2023-06-30'), 'H1 2023'),
-        (pd.Timestamp('2022-01-01'), pd.Timestamp('2022-06-30'), 'H1 2022'),
-        (pd.Timestamp('2021-01-01'), pd.Timestamp('2021-06-30'), 'H1 2021'),
-        (pd.Timestamp('2020-01-01'), pd.Timestamp('2020-06-30'), 'H1 2020'),
-    ]
-    
-    all_period_results = []
-    
-    for start_date, end_date, period_name in test_periods:
-        print(f"\n{'='*60}")
-        print(f"Testing period: {period_name}")
-        print(f"{'='*60}")
-        
-        try:
-            # Load once per period and feed into backtester
-            loader = DataLoader()
-            print("Loading data...")
-            spot_data, options_data = loader.create_synchronized_dataset(
-                spot_symbol='BTCUSDT',
-                underlying='BTC',
-                start_date=start_date,
-                end_date=end_date,
-                option_filters={'min_volume': 0}
-            )
-            
-            results = run_portfolio_backtest(
-                strategy_configs=strategies,
-                merged_data=options_data,
-                max_options=30,  # Test top 30 most liquid options per period
-                target_dte=30,
-                moneyness_filter='ATM'
-            )
-            
-            if not results.empty:
-                results['period'] = period_name
-                all_period_results.append(results)
-                
-        except Exception as e:
-            print(f"Error testing period {period_name}: {e}")
-            continue
-    
-    # Combine all results
-    if all_period_results:
-        combined_results = pd.concat(all_period_results, ignore_index=True)
-        
-        # Save combined results
-        output_file = Path('backtest/results') / 'all_periods_gamma_scalping.csv'
-        combined_results.to_csv(output_file, index=False)
-        
-        print("\n" + "="*60)
-        print("OVERALL SUMMARY")
-        print("="*60)
-        
-        # Summary by strategy across all periods
-        overall_summary = combined_results.groupby('strategy').agg({
-            'total_pnl': ['sum', 'mean', 'std'],
-            'option_pnl': 'sum',
-            'hedge_pnl': 'sum',
-            'num_hedges': 'mean'
-        }).round(2)
-        
-        print(overall_summary)
-        print(f"\nAll results saved to: {output_file}")
-    
-    return combined_results if all_period_results else pd.DataFrame()
-
-
-if __name__ == "__main__":
-    results = main()
