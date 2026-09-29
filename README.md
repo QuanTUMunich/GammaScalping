@@ -1,6 +1,6 @@
 # Gamma Scalping: Trading Realized vs Implied Volatility
 
-[![tests](https://github.com/ivanvgreiff/gamma-scalping-algorithm/actions/workflows/tests.yml/badge.svg)](https://github.com/ivanvgreiff/gamma-scalping-algorithm/actions/workflows/tests.yml)
+[![tests](https://github.com/QuanTUMunich/GammaScalping/actions/workflows/tests.yml/badge.svg)](https://github.com/QuanTUMunich/GammaScalping/actions/workflows/tests.yml)
 
 A research project on **gamma scalping** (dynamic delta hedging of a long option) applied to **BTC options on Deribit**.
 
