@@ -43,17 +43,35 @@ All results use GBM paths with an ATM call, $S_0 = K = 100$, $T = 1$ year and $r
 
 These properties are checked by the test suite in [`tests/`](tests). To regenerate the figures, run `python scripts/make_figures.py`.
 
-## Real-data backtest (work in progress)
+## Results (real data)
 
 [`notebooks/real_data_backtest.ipynb`](notebooks/real_data_backtest.ipynb) runs the strategy on real market data. For each strategy variant, it:
 
-1. Loads Deribit BTC options and Binance BTC hourly spot prices for a chosen window (Jan–Mar 2025 in the notebook).
+1. Loads Deribit BTC options and Binance BTC hourly spot prices for a chosen window (Jan–Feb 2025 in the notebook).
 2. Selects ATM options with about 30 days to expiry.
-3. Backs out implied volatility from traded option prices.
-4. Delta-hedges each position whenever the net delta exceeds a threshold (2.5%–15% variants).
-5. Reports P&L attribution, hedge counts and costs.
+3. Converts option prices from BTC to USD and backs out implied volatility from them.
+4. Checks the hedge every hour and rebalances whenever the net delta exceeds a threshold (2.5%–15% variants).
+5. Reports P&L attribution, hedge counts and costs (5 bps commission, 10 bps slippage).
 
-The logic lives in [`data/data_loader.py`](data/data_loader.py), [`simulation/gamma_scalping_simulator.py`](simulation/gamma_scalping_simulator.py), [`backtest/backtest_engine.py`](backtest/backtest_engine.py) and [`strategies/gamma_scalping.py`](strategies/gamma_scalping.py). The results have not been validated yet. Treat them as a starting point, not as evidence of an edge.
+**Result for Jan–Feb 2025** (30 ATM options, one contract each):
+
+| Hedge threshold | Total P&L | P&L per option | Hedges per option |
+|---|---|---|---|
+| No hedge | −$113,285 | −$3,776 | 0 |
+| 15% | −$17,730 | −$591 | 9 |
+| 10% | −$15,504 | −$517 | 14 |
+| 5% | −$20,953 | −$698 | 31 |
+| 2.5% | −$25,627 | −$854 | 59 |
+
+Hedging removes most of the directional loss while BTC fell from about $108k to $79k, but the strategy still loses money:
+
+- Average implied vol at entry was 54% and realized vol while holding was 58%. That edge was too small to cover costs.
+- More frequent hedging only adds costs.
+- Across options, P&L is strongly correlated with realized minus implied vol (ρ ≈ 0.73), which matches the theory above.
+
+The takeaway is that gamma scalping only pays when you can predict that realized vol will clearly exceed implied vol, which is the goal of the volatility forecasting work.
+
+The logic lives in [`data/data_loader.py`](data/data_loader.py), [`simulation/gamma_scalping_simulator.py`](simulation/gamma_scalping_simulator.py), [`backtest/backtest_engine.py`](backtest/backtest_engine.py) and [`strategies/gamma_scalping.py`](strategies/gamma_scalping.py). [`tests/test_real_data_simulator.py`](tests/test_real_data_simulator.py) checks the simulator on synthetic BTC-quoted prices: it must recover the true implied vol and replicate the option when realized vol equals implied vol.
 
 ## Repository structure
 
@@ -75,7 +93,7 @@ The logic lives in [`data/data_loader.py`](data/data_loader.py), [`simulation/ga
 │   ├── data_loader.py                        # loads parsed spot + per-option data
 │   └── scripts/                              # download → parse → bar-building pipeline
 ├── scripts/make_figures.py                   # regenerates docs/figures
-└── tests/                                    # pricing + Monte Carlo sanity tests (run in CI)
+└── tests/                                    # pricing, Monte Carlo and real-data simulator tests (run in CI)
 ```
 
 ## Data
@@ -102,7 +120,7 @@ The simulation notebooks are self-contained and need no data. `volatility_inspec
 ## Next steps
 
 - **Volatility forecasting:** add HAR-RV (daily/weekly/monthly RV terms) and HAR + IV, evaluated walk-forward with QLIKE against the GARCH and naive baselines.
-- **Signal-driven backtest:** only buy options when the forecast RV exceeds IV, and validate the real-data P&L attribution.
+- **Signal-driven backtest:** only buy options when the forecast RV clearly exceeds IV, over many periods, not just Jan–Feb 2025.
 - **Variance risk premium:** measure how often historical Deribit IV exceeded the RV that followed.
 
 ## Credits

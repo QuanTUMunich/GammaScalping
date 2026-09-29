@@ -55,11 +55,14 @@ class GammaScalpingSimulator:
         self,
         commission_rate: float = 0.0005,
         slippage_bps: float = 10,
-        risk_free_rate: float = 0.01
+        risk_free_rate: float = 0.01,
+        option_prices_in_underlying: bool = True
     ):
         self.commission_rate = commission_rate
         self.slippage_bps = slippage_bps / 10000
         self.risk_free_rate = risk_free_rate
+        # Deribit quotes BTC options in BTC; convert to USD with the spot price
+        self.option_prices_in_underlying = option_prices_in_underlying
         
     def simulate(
         self,
@@ -111,19 +114,24 @@ class GammaScalpingSimulator:
         spot_prices_indexed = spot_prices.set_index('timestamp')
         option_data_indexed = option_data.set_index('timestamp')
 
-        # Merge spot and option data for aligned processing
-        merged_data = pd.merge(
-            option_data_indexed[['close']],
-            spot_prices_indexed[['close']],
-            left_index=True,
-            right_index=True,
-            suffixes=('_option', '_spot'),
-            how='inner'
-        )
+        # Walk the (hourly) spot timeline from the first option trade until expiry or the end
+        # of the data, carrying the last traded option price forward between trades, so the
+        # hedge can be rebalanced every hour and not only when the option happens to trade.
+        option_close = option_data_indexed['close'][~option_data_indexed.index.duplicated(keep='last')]
+        spot_close = spot_prices_indexed['close'][~spot_prices_indexed.index.duplicated(keep='last')]
+        timeline = spot_close.index[(spot_close.index >= option_close.index.min()) & (spot_close.index <= expiry)]
+        merged_data = pd.DataFrame({
+            'close_option': option_close.reindex(timeline.union(option_close.index)).ffill().reindex(timeline),
+            'close_spot': spot_close.reindex(timeline),
+        }).dropna()
+        merged_data.index.name = 'timestamp'
         merged_data = merged_data.reset_index()  # Get timestamp back as column
 
         if merged_data.empty:
             return None
+
+        if self.option_prices_in_underlying:
+            merged_data['close_option'] = merged_data['close_option'] * merged_data['close_spot']
 
         # Get initial option price and open position
         initial_timestamp = merged_data.iloc[0]['timestamp']
@@ -267,14 +275,20 @@ class GammaScalpingSimulator:
         if pnl_history:
             final_spot = pnl_history[-1]['spot_price']
             
-            # Option payoff at expiry
-            if option_type == 'call':
+            # Option payoff at expiry; if the data ends before expiry, close at the last market price
+            if expiry - pnl_history[-1]['timestamp'] > pd.Timedelta(hours=1):
+                option_payoff = pnl_history[-1]['option_price'] * position_size
+            elif option_type == 'call':
                 option_payoff = max(0, final_spot - strike) * position_size
             else:
                 option_payoff = max(0, strike - final_spot) * position_size
                 
             final_option_pnl = option_payoff - option_cost
             
+            # Final hedge P&L (value at close minus cost basis), including hedge trades already
+            # round-tripped, so it is not lost when the hedge is already flat at the end
+            final_hedge_pnl = (hedge_position * final_spot) - hedge_cost_basis
+
             # Close hedge position
             if abs(hedge_position) > 0.001:
                 hedge_close_notional = abs(hedge_position * final_spot)
@@ -283,9 +297,6 @@ class GammaScalpingSimulator:
                 
                 total_commissions += hedge_close_commission
                 total_slippage += hedge_close_slippage
-                
-                # Final hedge P&L (value at expiry minus cost basis)
-                final_hedge_pnl = (hedge_position * final_spot) - hedge_cost_basis
                 
                 trades.append({
                     'timestamp': expiry,
@@ -296,8 +307,6 @@ class GammaScalpingSimulator:
                     'commission': hedge_close_commission,
                     'slippage': hedge_close_slippage
                 })
-            else:
-                final_hedge_pnl = 0
                 
             final_total_pnl = final_option_pnl + final_hedge_pnl - total_commissions - total_slippage
             
